@@ -11,6 +11,7 @@ import com.railiq.repository.HistoricalRunRepository;
 import com.railiq.repository.TrainRepository;
 import com.railiq.service.WeatherService;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.ResponseEntity;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.web.bind.annotation.*;
@@ -27,7 +28,8 @@ import java.util.Optional;
 @RequestMapping("/api/predictions")
 public class PredictionController {
 
-    private static final String ML_SERVICE_BASE = "http://localhost:8000";
+    @Value("${ml.service.base:http://localhost:8000}")
+    private String mlServiceBase;
 
     @Autowired
     private HistoricalRunRepository historicalRunRepository;
@@ -89,7 +91,7 @@ public class PredictionController {
         mlRequest.setWeatherRiskScore(weatherRisk);
 
         DelayPredictionResponse mlResponse = restTemplate.postForObject(
-                ML_SERVICE_BASE + "/predict-delay",
+                mlServiceBase + "/predict-delay",
                 mlRequest,
                 DelayPredictionResponse.class
         );
@@ -122,7 +124,7 @@ public class PredictionController {
         mlRequest.setTrainClearanceRate(clearanceRate);
 
         ConfirmationPredictionResponse mlResponse = restTemplate.postForObject(
-                ML_SERVICE_BASE + "/predict-confirmation",
+                mlServiceBase + "/predict-confirmation",
                 mlRequest,
                 ConfirmationPredictionResponse.class
         );
@@ -131,8 +133,7 @@ public class PredictionController {
 
     // Computes this train's historical clearance rate from HISTORICAL_BOOKINGS_V2.
     // Falls back to 0.64 (the dataset-wide average) if this specific train has no rows yet.
-    // NOTE: uses COALESCE (Postgres) instead of NVL (Oracle-only), and no FROM DUAL
-    // (Postgres doesn't need or support that).
+    // Uses COALESCE (Postgres) instead of NVL (Oracle-only), no FROM DUAL.
     private double getTrainClearanceRate(String trainNo, Integer tripNumber) {
         String sql = "SELECT COALESCE(" +
                 "  (SELECT SUM(CASE WHEN FINAL_STATUS = 'CONFIRMED' THEN 1 ELSE 0 END) * 1.0 / COUNT(*) " +
@@ -176,7 +177,7 @@ public class PredictionController {
             mlRequest.setTrainClearanceRate(clearanceRate);
 
             ConfirmationPredictionResponse confResponse = restTemplate.postForObject(
-                    ML_SERVICE_BASE + "/predict-confirmation",
+                    mlServiceBase + "/predict-confirmation",
                     mlRequest,
                     ConfirmationPredictionResponse.class
             );
