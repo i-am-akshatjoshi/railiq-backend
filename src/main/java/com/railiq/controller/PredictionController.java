@@ -6,6 +6,8 @@ import com.railiq.dto.DelayPredictionResponse;
 import com.railiq.dto.TrainRecommendation;
 import com.railiq.dto.ConfirmationPredictionRequest;
 import com.railiq.dto.ConfirmationPredictionResponse;
+import com.railiq.dto.BatchConfirmationRequest;
+import com.railiq.dto.BatchConfirmationResponse;
 import com.railiq.entity.Train;
 import com.railiq.repository.HistoricalRunRepository;
 import com.railiq.repository.TrainRepository;
@@ -100,6 +102,7 @@ public class PredictionController {
 
     // GET /api/predictions/confirmation-probability/{trainNo}/{tripNumber}
     //     ?daysBeforeJourney=10&initialWlPosition=23&quota=GN&travelClass=SL
+    // Still used for single-train lookups elsewhere in the app - unchanged.
     @GetMapping("/confirmation-probability/{trainNo}/{tripNumber}")
     public ResponseEntity<?> getConfirmationProbability(
             @PathVariable String trainNo,
@@ -156,9 +159,44 @@ public class PredictionController {
          @RequestParam String travelClass) {
 
         List<Object[]> rows = historicalRunRepository.findReliabilityByRoute(source, destination);
-        List<TrainRecommendation> results = new ArrayList<>();
+        if (rows.isEmpty()) {
+            return new ArrayList<>();
+        }
 
+        // Build ONE batch request covering every candidate train, instead of
+        // calling the ML service once per train in a loop (that burst of rapid
+        // individual requests was triggering Render's free-tier rate limit - 429s).
+        List<ConfirmationPredictionRequest> batchItems = new ArrayList<>();
         for (Object[] row : rows) {
+            String trainNo = (String) row[0];
+            Integer tripNumber = (Integer) row[1];
+            double clearanceRate = getTrainClearanceRate(trainNo, tripNumber);
+
+            ConfirmationPredictionRequest item = new ConfirmationPredictionRequest();
+            item.setDaysBeforeJourney(daysBeforeJourney);
+            item.setInitialWlPosition(initialWlPosition);
+            item.setQuota(quota);
+            item.setTravelClass(travelClass);
+            item.setTrainClearanceRate(clearanceRate);
+            batchItems.add(item);
+        }
+
+        BatchConfirmationRequest batchRequest = new BatchConfirmationRequest();
+        batchRequest.setTrains(batchItems);
+
+        BatchConfirmationResponse batchResponse = restTemplate.postForObject(
+                mlServiceBase + "/predict-confirmation-batch",
+                batchRequest,
+                BatchConfirmationResponse.class
+        );
+
+        List<Double> confirmationPcts = (batchResponse != null && batchResponse.getConfirmationProbabilities() != null)
+                ? batchResponse.getConfirmationProbabilities()
+                : new ArrayList<>();
+
+        List<TrainRecommendation> results = new ArrayList<>();
+        for (int i = 0; i < rows.size(); i++) {
+            Object[] row = rows.get(i);
             String trainNo = (String) row[0];
             Integer tripNumber = (Integer) row[1];
             String trainName = (String) row[2];
@@ -167,22 +205,7 @@ public class PredictionController {
             Long onTimeRuns = (Long) row[5];
             Double onTimePct = totalRuns > 0 ? (onTimeRuns * 100.0 / totalRuns) : 0.0;
 
-            double clearanceRate = getTrainClearanceRate(trainNo, tripNumber);
-
-            ConfirmationPredictionRequest mlRequest = new ConfirmationPredictionRequest();
-            mlRequest.setDaysBeforeJourney(daysBeforeJourney);
-            mlRequest.setInitialWlPosition(initialWlPosition);
-            mlRequest.setQuota(quota);
-            mlRequest.setTravelClass(travelClass);
-            mlRequest.setTrainClearanceRate(clearanceRate);
-
-            ConfirmationPredictionResponse confResponse = restTemplate.postForObject(
-                    mlServiceBase + "/predict-confirmation",
-                    mlRequest,
-                    ConfirmationPredictionResponse.class
-            );
-
-            Double confirmationPct = confResponse != null ? confResponse.getConfirmationProbabilityPercent() : 0.0;
+            Double confirmationPct = (i < confirmationPcts.size()) ? confirmationPcts.get(i) : 0.0;
 
             // 60% weight on confirmation probability, 40% on reliability
             double combinedScore = (0.6 * confirmationPct) + (0.4 * onTimePct);
