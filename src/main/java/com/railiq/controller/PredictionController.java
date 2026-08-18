@@ -49,14 +49,41 @@ public class PredictionController {
     @Autowired
     private WeatherService weatherService;
 
-    // Retry wrapper for calls to the ML service. Render's free tier can return
-    // 429 while the service is still cold-starting/waking from sleep, even
-    // though the app itself has no rate limiting - this is a platform-level
-    // hiccup, not a real "too many requests" situation. Retrying a few times
-    // with a short delay resolves it once the service finishes waking up.
+    @Autowired
+    private org.springframework.web.client.RestTemplate warmupRestTemplate;
+
+    // Actively wakes up the ML service before making a real prediction call.
+    // Render free-tier services can take 30-60+ seconds to fully boot when
+    // cold (this app loads a large model file on startup) - a short retry
+    // window on the actual POST isn't enough. This pings the lightweight
+    // root endpoint repeatedly until it responds, or gives up after 90s.
+    private void warmUpMlService() {
+        long deadline = System.currentTimeMillis() + 90_000; // 90 second budget
+        long pollDelayMs = 3000;
+
+        while (System.currentTimeMillis() < deadline) {
+            try {
+                restTemplate.getForObject(mlServiceBase + "/", String.class);
+                return; // service responded - it's awake
+            } catch (Exception ex) {
+                try {
+                    Thread.sleep(pollDelayMs);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
+            }
+        }
+        // Give up silently - the actual prediction call below will still be
+        // attempted and will surface its own error if the service never woke up.
+    }
+
+    // Retry wrapper for the actual prediction call, used AFTER warmUpMlService()
+    // has already confirmed (or attempted to confirm) the service is awake.
+    // Still retries a few times in case of a brief additional hiccup.
     private <T> T callMlServiceWithRetry(String url, Object requestBody, Class<T> responseType) {
-        int maxAttempts = 4;
-        long delayMs = 2000;
+        int maxAttempts = 5;
+        long delayMs = 3000;
 
         for (int attempt = 1; attempt <= maxAttempts; attempt++) {
             try {
@@ -71,11 +98,9 @@ public class PredictionController {
                     Thread.currentThread().interrupt();
                     throw ex;
                 }
-                // Back off a bit more each retry
-                delayMs += 1500;
+                delayMs += 2000;
             }
         }
-        // Unreachable, but required for compilation
         throw new IllegalStateException("ML service call failed after retries");
     }
 
