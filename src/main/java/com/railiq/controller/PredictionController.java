@@ -17,6 +17,7 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.ResponseEntity;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.web.bind.annotation.*;
+import org.springframework.web.client.HttpClientErrorException;
 import org.springframework.web.client.RestTemplate;
 
 import java.time.LocalDate;
@@ -47,6 +48,36 @@ public class PredictionController {
 
     @Autowired
     private WeatherService weatherService;
+
+    // Retry wrapper for calls to the ML service. Render's free tier can return
+    // 429 while the service is still cold-starting/waking from sleep, even
+    // though the app itself has no rate limiting - this is a platform-level
+    // hiccup, not a real "too many requests" situation. Retrying a few times
+    // with a short delay resolves it once the service finishes waking up.
+    private <T> T callMlServiceWithRetry(String url, Object requestBody, Class<T> responseType) {
+        int maxAttempts = 4;
+        long delayMs = 2000;
+
+        for (int attempt = 1; attempt <= maxAttempts; attempt++) {
+            try {
+                return restTemplate.postForObject(url, requestBody, responseType);
+            } catch (HttpClientErrorException.TooManyRequests ex) {
+                if (attempt == maxAttempts) {
+                    throw ex;
+                }
+                try {
+                    Thread.sleep(delayMs);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    throw ex;
+                }
+                // Back off a bit more each retry
+                delayMs += 1500;
+            }
+        }
+        // Unreachable, but required for compilation
+        throw new IllegalStateException("ML service call failed after retries");
+    }
 
     // GET /api/predictions/best-trains?source=HYB&destination=AII
     @GetMapping("/best-trains")
@@ -92,7 +123,7 @@ public class PredictionController {
         mlRequest.setIsFestivalSeason(0);
         mlRequest.setWeatherRiskScore(weatherRisk);
 
-        DelayPredictionResponse mlResponse = restTemplate.postForObject(
+        DelayPredictionResponse mlResponse = callMlServiceWithRetry(
                 mlServiceBase + "/predict-delay",
                 mlRequest,
                 DelayPredictionResponse.class
@@ -126,7 +157,7 @@ public class PredictionController {
         mlRequest.setTravelClass(travelClass);
         mlRequest.setTrainClearanceRate(clearanceRate);
 
-        ConfirmationPredictionResponse mlResponse = restTemplate.postForObject(
+        ConfirmationPredictionResponse mlResponse = callMlServiceWithRetry(
                 mlServiceBase + "/predict-confirmation",
                 mlRequest,
                 ConfirmationPredictionResponse.class
@@ -184,7 +215,7 @@ public class PredictionController {
         BatchConfirmationRequest batchRequest = new BatchConfirmationRequest();
         batchRequest.setTrains(batchItems);
 
-        BatchConfirmationResponse batchResponse = restTemplate.postForObject(
+        BatchConfirmationResponse batchResponse = callMlServiceWithRetry(
                 mlServiceBase + "/predict-confirmation-batch",
                 batchRequest,
                 BatchConfirmationResponse.class
