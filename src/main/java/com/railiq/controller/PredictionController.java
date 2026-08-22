@@ -23,8 +23,10 @@ import org.springframework.web.client.RestTemplate;
 import java.time.LocalDate;
 import java.time.format.TextStyle;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Optional;
 
 @RestController
@@ -192,6 +194,7 @@ public class PredictionController {
     // Computes this train's historical clearance rate from HISTORICAL_BOOKINGS_V2.
     // Falls back to 0.64 (the dataset-wide average) if this specific train has no rows yet.
     // Uses COALESCE (Postgres) instead of NVL (Oracle-only), no FROM DUAL.
+    // Still used by the single-train confirmation-probability endpoint above.
     private double getTrainClearanceRate(String trainNo, Integer tripNumber) {
         String sql = "SELECT COALESCE(" +
                 "  (SELECT SUM(CASE WHEN FINAL_STATUS = 'CONFIRMED' THEN 1 ELSE 0 END) * 1.0 / COUNT(*) " +
@@ -200,6 +203,48 @@ public class PredictionController {
                 "  0.64)";
         Double rate = jdbcTemplate.queryForObject(sql, Double.class, trainNo, tripNumber);
         return rate != null ? rate : 0.64;
+    }
+
+    // Computes clearance rates for MULTIPLE trains in ONE query instead of one
+    // query per train - this was the main source of slowness in /recommend,
+    // since a route with N candidate trains was making N separate sequential
+    // round-trips to Neon before ever reaching the ML service call.
+    private Map<String, Double> getTrainClearanceRatesBatch(List<Object[]> rows) {
+        Map<String, Double> result = new HashMap<>();
+        if (rows.isEmpty()) {
+            return result;
+        }
+
+        StringBuilder sql = new StringBuilder(
+                "SELECT TRAIN_NO, TRIP_NUMBER, " +
+                "SUM(CASE WHEN FINAL_STATUS = 'CONFIRMED' THEN 1 ELSE 0 END) * 1.0 / COUNT(*) AS RATE " +
+                "FROM HISTORICAL_BOOKINGS_V2 WHERE (TRAIN_NO, TRIP_NUMBER) IN (");
+
+        List<Object> params = new ArrayList<>();
+        for (int i = 0; i < rows.size(); i++) {
+            Object[] row = rows.get(i);
+            sql.append("(?, ?)");
+            if (i < rows.size() - 1) sql.append(", ");
+            params.add((String) row[0]);
+            params.add((Integer) row[1]);
+        }
+        sql.append(") GROUP BY TRAIN_NO, TRIP_NUMBER");
+
+        List<Map<String, Object>> rawResults = jdbcTemplate.queryForList(sql.toString(), params.toArray());
+        for (Map<String, Object> r : rawResults) {
+            String key = r.get("train_no") + "|" + r.get("trip_number");
+            Double rate = ((Number) r.get("rate")).doubleValue();
+            result.put(key, rate);
+        }
+
+        // Fill in the 0.64 dataset-wide default for any train that had zero
+        // rows in HISTORICAL_BOOKINGS_V2 (so it didn't come back from the query above)
+        for (Object[] row : rows) {
+            String key = row[0] + "|" + row[1];
+            result.putIfAbsent(key, 0.64);
+        }
+
+        return result;
     }
 
     // GET /api/predictions/recommend?source=HYB&destination=AII
@@ -222,6 +267,10 @@ public class PredictionController {
         // request - avoids hitting it mid-cold-start and getting a 502/429.
         warmUpMlService();
 
+        // ONE query for all trains' clearance rates, instead of one query per
+        // train in a loop - this was the main slowdown before the ML call even started.
+        Map<String, Double> clearanceRates = getTrainClearanceRatesBatch(rows);
+
         // Build ONE batch request covering every candidate train, instead of
         // calling the ML service once per train in a loop (that burst of rapid
         // individual requests was triggering Render's free-tier rate limit - 429s).
@@ -229,7 +278,7 @@ public class PredictionController {
         for (Object[] row : rows) {
             String trainNo = (String) row[0];
             Integer tripNumber = (Integer) row[1];
-            double clearanceRate = getTrainClearanceRate(trainNo, tripNumber);
+            double clearanceRate = clearanceRates.getOrDefault(trainNo + "|" + tripNumber, 0.64);
 
             ConfirmationPredictionRequest item = new ConfirmationPredictionRequest();
             item.setDaysBeforeJourney(daysBeforeJourney);
