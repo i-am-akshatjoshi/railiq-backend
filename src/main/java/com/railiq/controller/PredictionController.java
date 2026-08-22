@@ -49,9 +49,6 @@ public class PredictionController {
     @Autowired
     private WeatherService weatherService;
 
-    @Autowired
-    private org.springframework.web.client.RestTemplate warmupRestTemplate;
-
     // Actively wakes up the ML service before making a real prediction call.
     // Render free-tier services can take 30-60+ seconds to fully boot when
     // cold (this app loads a large model file on startup) - a short retry
@@ -80,7 +77,9 @@ public class PredictionController {
 
     // Retry wrapper for the actual prediction call, used AFTER warmUpMlService()
     // has already confirmed (or attempted to confirm) the service is awake.
-    // Still retries a few times in case of a brief additional hiccup.
+    // Catches both 429 (rate limit) and 502 (proxy says backend not ready yet) -
+    // both are transient cold-start symptoms on Render's free tier, not real
+    // application errors.
     private <T> T callMlServiceWithRetry(String url, Object requestBody, Class<T> responseType) {
         int maxAttempts = 5;
         long delayMs = 3000;
@@ -88,7 +87,7 @@ public class PredictionController {
         for (int attempt = 1; attempt <= maxAttempts; attempt++) {
             try {
                 return restTemplate.postForObject(url, requestBody, responseType);
-            } catch (HttpClientErrorException.TooManyRequests ex) {
+            } catch (HttpClientErrorException.TooManyRequests | org.springframework.web.client.HttpServerErrorException.BadGateway ex) {
                 if (attempt == maxAttempts) {
                     throw ex;
                 }
@@ -218,6 +217,10 @@ public class PredictionController {
         if (rows.isEmpty()) {
             return new ArrayList<>();
         }
+
+        // Wake the ML service up first, before building/sending the real
+        // request - avoids hitting it mid-cold-start and getting a 502/429.
+        warmUpMlService();
 
         // Build ONE batch request covering every candidate train, instead of
         // calling the ML service once per train in a loop (that burst of rapid
